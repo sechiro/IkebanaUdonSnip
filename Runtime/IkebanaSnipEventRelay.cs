@@ -20,6 +20,7 @@ namespace Hatago.IkebanaUdonSnip
         public float minInvokeIntervalSeconds = 0.15f;
         public bool enableDebugLog;
         private float _nextInvokeAllowedTime;
+        private const string PickupTrackedTargetsClearEvent = "OnScissorPickedUp";
 
         // Interact経由の発火は使用しないため、メソッド全体を無効化
         /*
@@ -61,6 +62,11 @@ namespace Hatago.IkebanaUdonSnip
             }
 
             resolvedPickupTarget.SendCustomEvent(resolvedPickupEvent);
+
+            if (targetBehaviour != null && eventName == "CutOneTouchedTarget")
+            {
+                targetBehaviour.SendCustomEvent(PickupTrackedTargetsClearEvent);
+            }
         }
 
         public override void OnDrop()

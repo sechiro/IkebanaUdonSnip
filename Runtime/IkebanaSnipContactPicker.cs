@@ -11,6 +11,7 @@ namespace Hatago.IkebanaUdonSnip
         public int maxUndoHistory = 64;
         public int maxRegisteredRootCutters = 16;
         public float minCutIntervalSeconds = 0.15f;
+        public int maxCutCompletionCheckFrames = 240;
         public IkebanaUdonSnip rootCutter;
         public IkebanaUdonSnip[] registeredRootCutters;
         public int registeredRootCutterCount;
@@ -25,6 +26,9 @@ namespace Hatago.IkebanaUdonSnip
         private IkebanaUdonSnip[] _managedCutters;
         private int _managedCount;
         private IkebanaUdonSnip[] _managedQueue;
+        private IkebanaUdonSnip _pendingCutTarget;
+        private int _pendingCutVersion;
+        private int _pendingCutCheckFrames;
 
         public void Start()
         {
@@ -39,6 +43,10 @@ namespace Hatago.IkebanaUdonSnip
             if (maxRegisteredRootCutters < 1)
             {
                 maxRegisteredRootCutters = 1;
+            }
+            if (maxCutCompletionCheckFrames < 1)
+            {
+                maxCutCompletionCheckFrames = 1;
             }
 
             _trackedCutters = new IkebanaUdonSnip[maxTrackedCutters];
@@ -81,6 +89,7 @@ namespace Hatago.IkebanaUdonSnip
             _managedCutters = new IkebanaUdonSnip[maxTrackedCutters];
             _managedQueue = new IkebanaUdonSnip[maxTrackedCutters];
             _managedCount = 0;
+            ClearPendingCutCheck();
             RefreshManagedCutterScope();
         }
 
@@ -135,15 +144,26 @@ namespace Hatago.IkebanaUdonSnip
             Remove(cutter);
         }
 
+        public void OnScissorPickedUp()
+        {
+            ClearTrackedCutters();
+            ClearPendingCutCheck();
+        }
+
         public void CutOneTouchedTarget()
         {
+            if (_pendingCutTarget != null)
+            {
+                return;
+            }
+
             if (Time.time < _nextCutAllowedTime)
             {
                 return;
             }
 
             Compact();
-            while (_trackedCount > 0 && !IsCutterInScope(_trackedCutters[0]))
+            while (_trackedCount > 0 && !IsTrackedTargetValidForCut(_trackedCutters[0]))
             {
                 RemoveAt(0);
             }
@@ -163,12 +183,49 @@ namespace Hatago.IkebanaUdonSnip
             {
                 int beforeCutVersion = target.GetCutVersion();
                 target.CutNow();
+                _nextCutAllowedTime = Time.time + minCutIntervalSeconds;
                 if (target.GetCutVersion() > beforeCutVersion)
                 {
-                    _nextCutAllowedTime = Time.time + minCutIntervalSeconds;
                     PushUndoHistory(target);
                 }
+                else
+                {
+                    _pendingCutTarget = target;
+                    _pendingCutVersion = beforeCutVersion;
+                    _pendingCutCheckFrames = 0;
+                    SendCustomEventDelayedFrames(nameof(CheckPendingCutCompletion), 1);
+                }
             }
+        }
+
+        public void CheckPendingCutCompletion()
+        {
+            if (_pendingCutTarget == null)
+            {
+                return;
+            }
+
+            if (_pendingCutTarget.GetCutVersion() > _pendingCutVersion)
+            {
+                PushUndoHistory(_pendingCutTarget);
+                ClearPendingCutCheck();
+                return;
+            }
+
+            if (!_pendingCutTarget.IsCutInProgress())
+            {
+                ClearPendingCutCheck();
+                return;
+            }
+
+            _pendingCutCheckFrames++;
+            if (_pendingCutCheckFrames >= maxCutCompletionCheckFrames)
+            {
+                ClearPendingCutCheck();
+                return;
+            }
+
+            SendCustomEventDelayedFrames(nameof(CheckPendingCutCompletion), 1);
         }
 
         public bool UndoLastCutTarget()
@@ -226,6 +283,7 @@ namespace Hatago.IkebanaUdonSnip
             RefreshManagedCutterScope();
             ClearTrackedCutters();
             ClearUndoHistory();
+            ClearPendingCutCheck();
             _nextCutAllowedTime = Time.time + minCutIntervalSeconds;
         }
 
@@ -422,6 +480,13 @@ namespace Hatago.IkebanaUdonSnip
             _undoHistoryCount = 0;
         }
 
+        private void ClearPendingCutCheck()
+        {
+            _pendingCutTarget = null;
+            _pendingCutVersion = 0;
+            _pendingCutCheckFrames = 0;
+        }
+
         private void ClearTrackedCutters()
         {
             for (int i = 0; i < _trackedCount; i++)
@@ -483,6 +548,36 @@ namespace Hatago.IkebanaUdonSnip
             }
 
             return ContainsManaged(cutter);
+        }
+
+        private bool IsTrackedTargetValidForCut(IkebanaUdonSnip cutter)
+        {
+            if (cutter == null)
+            {
+                return false;
+            }
+
+            if (!IsCutterInScope(cutter))
+            {
+                return false;
+            }
+
+            if (cutter.sourceMeshFilter == null)
+            {
+                return false;
+            }
+
+            if (!cutter.sourceMeshFilter.gameObject.activeInHierarchy)
+            {
+                return false;
+            }
+
+            if (cutter.sourceMeshCollider != null && !cutter.sourceMeshCollider.enabled)
+            {
+                return false;
+            }
+
+            return true;
         }
 
         private void EnqueueChildCutter(MeshFilter outputMeshFilter, ref int queueTail)

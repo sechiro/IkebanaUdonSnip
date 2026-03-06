@@ -47,6 +47,10 @@ namespace Hatago.IkebanaUdonSnip
         public float separationDistanceMeters = 0.01f;
         public bool enableDebugLog = false;
 
+        [Header("Performance")]
+        public bool spreadCutOverMultipleFrames = true;
+        public int cutTrianglesPerFrame = 128;
+
         [Header("Collision Cut")]
         public bool enableCutOnTriggerEnter = true;
         public string requiredCutterTriggerName = "CutTrigger";
@@ -148,6 +152,35 @@ namespace Hatago.IkebanaUdonSnip
         private Vector2[] _triNegPolyUv;
         private float[] _triNegPolyD;
         private Vector3[] _triCutPoints;
+        private bool _isCutJobRunning;
+        private Mesh _cutJobSourceMesh;
+        private Vector3[] _cutJobSourceVertices;
+        private int[] _cutJobSourceTriangles;
+        private Vector3[] _cutJobSourceNormals;
+        private Vector2[] _cutJobSourceUv;
+        private bool _cutJobHasNormals;
+        private bool _cutJobHasUv;
+        private Vector3 _cutJobPlanePointLocal;
+        private Vector3 _cutJobPlaneNormalLocal;
+        private Vector3 _cutJobPlaneNormalWorld;
+        private bool _cutJobCollectCapSegments;
+        private int _cutJobTriangleCount;
+        private int _cutJobTriangleCursor;
+        private int _cutJobPosVertexCount;
+        private int _cutJobPosIndexCount;
+        private int _cutJobNegVertexCount;
+        private int _cutJobNegIndexCount;
+        private int _cutJobCapSegmentCount;
+        private Vector3[] _cutJobPosVertices;
+        private Vector3[] _cutJobPosNormals;
+        private Vector2[] _cutJobPosUv;
+        private int[] _cutJobPosIndices;
+        private Vector3[] _cutJobNegVertices;
+        private Vector3[] _cutJobNegNormals;
+        private Vector2[] _cutJobNegUv;
+        private int[] _cutJobNegIndices;
+        private Vector3[] _cutJobCapSegmentStart;
+        private Vector3[] _cutJobCapSegmentEnd;
 
         public void Start()
         {
@@ -254,8 +287,19 @@ namespace Hatago.IkebanaUdonSnip
             return _cutVersion;
         }
 
+        public bool IsCutInProgress()
+        {
+            return _isCutJobRunning;
+        }
+
         public bool UndoLastCut()
         {
+            if (_isCutJobRunning)
+            {
+                Log("Undo suppressed because cut is still in progress.");
+                return false;
+            }
+
             if (!ValidateBindings())
             {
                 return false;
@@ -352,6 +396,11 @@ namespace Hatago.IkebanaUdonSnip
 
         public void ResetBranchToInitial()
         {
+            if (_isCutJobRunning)
+            {
+                ResetCutJobState();
+            }
+
             if (!ValidateBindings())
             {
                 return;
@@ -473,6 +522,12 @@ namespace Hatago.IkebanaUdonSnip
             Vector3 overridePlaneNormalWorld = _overridePlaneNormalWorld;
             _useOverridePlaneNormal = false;
 
+            if (_isCutJobRunning)
+            {
+                Log("Cut suppressed because a previous cut is still in progress.");
+                return;
+            }
+
             if (_hasCut && !allowMultipleCuts)
             {
                 Log("Cut suppressed because allowMultipleCuts is false.");
@@ -500,13 +555,75 @@ namespace Hatago.IkebanaUdonSnip
                 return;
             }
 
+            if (!TryPrepareCutJob(useOverridePlanePoint, overridePlanePointWorld, useOverridePlaneNormal, overridePlaneNormalWorld))
+            {
+                return;
+            }
+
+            bool useBatchedCut = spreadCutOverMultipleFrames && !_isApplyingSyncedCut;
+            if (!useBatchedCut)
+            {
+                ProcessCutTrianglesBatch(_cutJobTriangleCount);
+                FinalizeCutJob();
+                return;
+            }
+
+            int trianglesPerBatch = cutTrianglesPerFrame;
+            if (trianglesPerBatch < 1)
+            {
+                trianglesPerBatch = 1;
+            }
+
+            _isCutJobRunning = true;
+            ProcessCutTrianglesBatch(trianglesPerBatch);
+            if (_cutJobTriangleCursor >= _cutJobTriangleCount || _overflowed)
+            {
+                _isCutJobRunning = false;
+                FinalizeCutJob();
+                return;
+            }
+
+            SendCustomEventDelayedFrames(nameof(ContinueCutNow), 1);
+        }
+
+        public void ContinueCutNow()
+        {
+            if (!_isCutJobRunning)
+            {
+                return;
+            }
+
+            int trianglesPerBatch = cutTrianglesPerFrame;
+            if (trianglesPerBatch < 1)
+            {
+                trianglesPerBatch = 1;
+            }
+
+            ProcessCutTrianglesBatch(trianglesPerBatch);
+            if (_cutJobTriangleCursor < _cutJobTriangleCount && !_overflowed)
+            {
+                SendCustomEventDelayedFrames(nameof(ContinueCutNow), 1);
+                return;
+            }
+
+            _isCutJobRunning = false;
+            FinalizeCutJob();
+        }
+
+        private bool TryPrepareCutJob(
+            bool useOverridePlanePoint,
+            Vector3 overridePlanePointWorld,
+            bool useOverridePlaneNormal,
+            Vector3 overridePlaneNormalWorld)
+        {
+            ResetCutJobState();
             EnsureClipBuffers();
 
             Mesh sourceMesh = GetSourceMesh();
             if (sourceMesh == null)
             {
                 Log("Source mesh is null. Set sourceMeshFilter/sharedMesh (or sourceMeshCollider.sharedMesh).");
-                return;
+                return false;
             }
 
             Vector3[] sourceVertices = sourceMesh.vertices;
@@ -514,7 +631,7 @@ namespace Hatago.IkebanaUdonSnip
             if (sourceVertices == null || sourceTriangles == null || sourceTriangles.Length < 3)
             {
                 Log("Source mesh has no triangles.");
-                return;
+                return false;
             }
 
             Vector3[] sourceNormals = sourceMesh.normals;
@@ -523,10 +640,10 @@ namespace Hatago.IkebanaUdonSnip
             bool hasUv = sourceUv != null && sourceUv.Length == sourceVertices.Length;
 
             Vector3 planePointWorld = useOverridePlanePoint ? overridePlanePointWorld : cutPlaneTransform.position;
-            Vector3 planePointLocal = sourceMeshFilter.transform.InverseTransformPoint(planePointWorld);
             Vector3 planeNormalWorld = useOverridePlaneNormal
                 ? overridePlaneNormalWorld
                 : (useCutPlaneUpAxis ? cutPlaneTransform.up : cutPlaneTransform.forward);
+
             if (planeNormalWorld.sqrMagnitude < 0.000001f)
             {
                 planeNormalWorld = useCutPlaneUpAxis ? cutPlaneTransform.up : cutPlaneTransform.forward;
@@ -536,6 +653,7 @@ namespace Hatago.IkebanaUdonSnip
                 planeNormalWorld = transform.up;
             }
             planeNormalWorld.Normalize();
+
             Vector3 planeNormalLocal = sourceMeshFilter.transform.InverseTransformDirection(planeNormalWorld);
             if (planeNormalLocal.sqrMagnitude < 0.000001f)
             {
@@ -543,116 +661,144 @@ namespace Hatago.IkebanaUdonSnip
             }
             planeNormalLocal.Normalize();
 
-            Vector3[] posVertices = new Vector3[maxGeneratedVerticesPerSide];
-            Vector3[] posNormals = new Vector3[maxGeneratedVerticesPerSide];
-            Vector2[] posUv = new Vector2[maxGeneratedVerticesPerSide];
-            int[] posIndices = new int[maxGeneratedIndicesPerSide];
+            bool collectCapSegments = generateCutCaps;
+            EnsureCutWorkBuffers(collectCapSegments);
 
-            Vector3[] negVertices = new Vector3[maxGeneratedVerticesPerSide];
-            Vector3[] negNormals = new Vector3[maxGeneratedVerticesPerSide];
-            Vector2[] negUv = new Vector2[maxGeneratedVerticesPerSide];
-            int[] negIndices = new int[maxGeneratedIndicesPerSide];
-
-            Vector3[] capSegmentStart = new Vector3[maxCutIntersections];
-            Vector3[] capSegmentEnd = new Vector3[maxCutIntersections];
-            int capSegmentCount = 0;
-
-            int posVertexCount = 0;
-            int posIndexCount = 0;
-            int negVertexCount = 0;
-            int negIndexCount = 0;
+            _cutJobSourceMesh = sourceMesh;
+            _cutJobSourceVertices = sourceVertices;
+            _cutJobSourceTriangles = sourceTriangles;
+            _cutJobSourceNormals = sourceNormals;
+            _cutJobSourceUv = sourceUv;
+            _cutJobHasNormals = hasNormals;
+            _cutJobHasUv = hasUv;
+            _cutJobPlanePointLocal = sourceMeshFilter.transform.InverseTransformPoint(planePointWorld);
+            _cutJobPlaneNormalLocal = planeNormalLocal;
+            _cutJobPlaneNormalWorld = planeNormalWorld;
+            _cutJobCollectCapSegments = collectCapSegments;
+            _cutJobTriangleCount = sourceTriangles.Length / 3;
+            _cutJobTriangleCursor = 0;
+            _cutJobPosVertexCount = 0;
+            _cutJobPosIndexCount = 0;
+            _cutJobNegVertexCount = 0;
+            _cutJobNegIndexCount = 0;
+            _cutJobCapSegmentCount = 0;
             _overflowed = false;
+            return true;
+        }
 
-            int triCount = sourceTriangles.Length / 3;
-            for (int tri = 0; tri < triCount; tri++)
+        private void ProcessCutTrianglesBatch(int maxTriangleCount)
+        {
+            if (maxTriangleCount < 1)
             {
-                int baseIndex = tri * 3;
-                int i0 = sourceTriangles[baseIndex];
-                int i1 = sourceTriangles[baseIndex + 1];
-                int i2 = sourceTriangles[baseIndex + 2];
+                maxTriangleCount = 1;
+            }
 
-                if (!IsVertexIndexValid(i0, sourceVertices.Length) || !IsVertexIndexValid(i1, sourceVertices.Length) || !IsVertexIndexValid(i2, sourceVertices.Length))
+            int processed = 0;
+            while (_cutJobTriangleCursor < _cutJobTriangleCount && processed < maxTriangleCount)
+            {
+                int baseIndex = _cutJobTriangleCursor * 3;
+                _cutJobTriangleCursor++;
+                processed++;
+
+                int i0 = _cutJobSourceTriangles[baseIndex];
+                int i1 = _cutJobSourceTriangles[baseIndex + 1];
+                int i2 = _cutJobSourceTriangles[baseIndex + 2];
+                if (!IsVertexIndexValid(i0, _cutJobSourceVertices.Length) || !IsVertexIndexValid(i1, _cutJobSourceVertices.Length) || !IsVertexIndexValid(i2, _cutJobSourceVertices.Length))
                 {
                     continue;
                 }
 
-                Vector3 v0 = sourceVertices[i0];
-                Vector3 v1 = sourceVertices[i1];
-                Vector3 v2 = sourceVertices[i2];
-
-                Vector3 n0 = hasNormals ? sourceNormals[i0] : ComputeFaceNormal(v0, v1, v2);
-                Vector3 n1 = hasNormals ? sourceNormals[i1] : n0;
-                Vector3 n2 = hasNormals ? sourceNormals[i2] : n0;
-
-                Vector2 uv0 = hasUv ? sourceUv[i0] : Vector2.zero;
-                Vector2 uv1 = hasUv ? sourceUv[i1] : Vector2.zero;
-                Vector2 uv2 = hasUv ? sourceUv[i2] : Vector2.zero;
-
-                float d0 = Vector3.Dot(v0 - planePointLocal, planeNormalLocal);
-                float d1 = Vector3.Dot(v1 - planePointLocal, planeNormalLocal);
-                float d2 = Vector3.Dot(v2 - planePointLocal, planeNormalLocal);
+                Vector3 v0 = _cutJobSourceVertices[i0];
+                Vector3 v1 = _cutJobSourceVertices[i1];
+                Vector3 v2 = _cutJobSourceVertices[i2];
 
                 Vector3 referenceNormal = ComputeFaceNormal(v0, v1, v2);
+                Vector3 n0 = _cutJobHasNormals ? _cutJobSourceNormals[i0] : referenceNormal;
+                Vector3 n1 = _cutJobHasNormals ? _cutJobSourceNormals[i1] : n0;
+                Vector3 n2 = _cutJobHasNormals ? _cutJobSourceNormals[i2] : n0;
+
+                Vector2 uv0 = _cutJobHasUv ? _cutJobSourceUv[i0] : Vector2.zero;
+                Vector2 uv1 = _cutJobHasUv ? _cutJobSourceUv[i1] : Vector2.zero;
+                Vector2 uv2 = _cutJobHasUv ? _cutJobSourceUv[i2] : Vector2.zero;
+
+                float d0 = Vector3.Dot(v0 - _cutJobPlanePointLocal, _cutJobPlaneNormalLocal);
+                float d1 = Vector3.Dot(v1 - _cutJobPlanePointLocal, _cutJobPlaneNormalLocal);
+                float d2 = Vector3.Dot(v2 - _cutJobPlanePointLocal, _cutJobPlaneNormalLocal);
+
                 ClipAndEmitTriangle(
                     v0, v1, v2,
                     n0, n1, n2,
                     uv0, uv1, uv2,
                     d0, d1, d2,
                     referenceNormal,
-                    posVertices, posNormals, posUv, posIndices,
-                    ref posVertexCount, ref posIndexCount,
-                    negVertices, negNormals, negUv, negIndices,
-                    ref negVertexCount, ref negIndexCount,
-                    capSegmentStart, capSegmentEnd, ref capSegmentCount);
-            }
+                    _cutJobCollectCapSegments,
+                    _cutJobPosVertices, _cutJobPosNormals, _cutJobPosUv, _cutJobPosIndices,
+                    ref _cutJobPosVertexCount, ref _cutJobPosIndexCount,
+                    _cutJobNegVertices, _cutJobNegNormals, _cutJobNegUv, _cutJobNegIndices,
+                    ref _cutJobNegVertexCount, ref _cutJobNegIndexCount,
+                    _cutJobCapSegmentStart, _cutJobCapSegmentEnd, ref _cutJobCapSegmentCount);
 
+                if (_overflowed)
+                {
+                    return;
+                }
+            }
+        }
+
+        private void FinalizeCutJob()
+        {
             if (_overflowed)
             {
                 Log("Cut aborted because generated mesh exceeded configured capacities.");
+                ResetCutJobState();
                 return;
             }
 
-            if (posIndexCount < 3 || negIndexCount < 3)
+            if (_cutJobPosIndexCount < 3 || _cutJobNegIndexCount < 3)
             {
                 Log("No valid cut result. Plane may not intersect mesh.");
+                ResetCutJobState();
                 return;
             }
 
-            if (generateCutCaps)
+            if (_cutJobCollectCapSegments)
             {
                 AppendCapFaces(
-                    capSegmentStart,
-                    capSegmentEnd,
-                    capSegmentCount,
-                    planePointLocal,
-                    planeNormalLocal,
-                    posVertices, posNormals, posUv, posIndices,
-                    ref posVertexCount, ref posIndexCount,
-                    negVertices, negNormals, negUv, negIndices,
-                    ref negVertexCount, ref negIndexCount);
+                    _cutJobCapSegmentStart,
+                    _cutJobCapSegmentEnd,
+                    _cutJobCapSegmentCount,
+                    _cutJobPlanePointLocal,
+                    _cutJobPlaneNormalLocal,
+                    _cutJobPosVertices, _cutJobPosNormals, _cutJobPosUv, _cutJobPosIndices,
+                    ref _cutJobPosVertexCount, ref _cutJobPosIndexCount,
+                    _cutJobNegVertices, _cutJobNegNormals, _cutJobNegUv, _cutJobNegIndices,
+                    ref _cutJobNegVertexCount, ref _cutJobNegIndexCount);
 
                 if (_overflowed)
                 {
                     Log("Cut aborted while generating cap faces due to capacity limits.");
+                    ResetCutJobState();
                     return;
                 }
             }
 
-            if (posVertexCount > MaxMeshVertexCount || negVertexCount > MaxMeshVertexCount)
+            if (_cutJobPosVertexCount > MaxMeshVertexCount || _cutJobNegVertexCount > MaxMeshVertexCount)
             {
                 Log("Cut aborted because generated mesh vertex count exceeded 65535.");
+                ResetCutJobState();
                 return;
             }
 
-            Mesh posMesh = BuildMesh(posVertices, posNormals, posUv, posIndices, posVertexCount, posIndexCount);
-            Mesh negMesh = BuildMesh(negVertices, negNormals, negUv, negIndices, negVertexCount, negIndexCount);
+            Mesh posMesh = BuildMesh(_cutJobPosVertices, _cutJobPosNormals, _cutJobPosUv, _cutJobPosIndices, _cutJobPosVertexCount, _cutJobPosIndexCount);
+            Mesh negMesh = BuildMesh(_cutJobNegVertices, _cutJobNegNormals, _cutJobNegUv, _cutJobNegIndices, _cutJobNegVertexCount, _cutJobNegIndexCount);
             if (posMesh == null || negMesh == null)
             {
                 Log("Cut aborted because output mesh build failed.");
+                ResetCutJobState();
                 return;
             }
 
-            Vector3 separationNormalWorld = planeNormalWorld;
+            Vector3 separationNormalWorld = _cutJobPlaneNormalWorld;
             if (separationNormalWorld.sqrMagnitude < 0.000001f)
             {
                 separationNormalWorld = cutPlaneTransform != null ? cutPlaneTransform.up : Vector3.up;
@@ -676,16 +822,37 @@ namespace Hatago.IkebanaUdonSnip
             else if (updateSourceColliderWhenNotDisabling && sourceMeshCollider != null)
             {
                 sourceMeshCollider.sharedMesh = null;
-                sourceMeshCollider.sharedMesh = sourceMesh;
+                sourceMeshCollider.sharedMesh = _cutJobSourceMesh;
             }
 
             _hasCut = true;
             _cutVersion++;
             if (enableGlobalSync && !_isApplyingSyncedCut)
             {
-                TrySyncCutState(planePointLocal, planeNormalLocal);
+                TrySyncCutState(_cutJobPlanePointLocal, _cutJobPlaneNormalLocal);
             }
             Log("Cut complete.");
+            ResetCutJobState();
+        }
+
+        private void ResetCutJobState()
+        {
+            _isCutJobRunning = false;
+            _cutJobSourceMesh = null;
+            _cutJobSourceVertices = null;
+            _cutJobSourceTriangles = null;
+            _cutJobSourceNormals = null;
+            _cutJobSourceUv = null;
+            _cutJobHasNormals = false;
+            _cutJobHasUv = false;
+            _cutJobCollectCapSegments = false;
+            _cutJobTriangleCount = 0;
+            _cutJobTriangleCursor = 0;
+            _cutJobPosVertexCount = 0;
+            _cutJobPosIndexCount = 0;
+            _cutJobNegVertexCount = 0;
+            _cutJobNegIndexCount = 0;
+            _cutJobCapSegmentCount = 0;
         }
 
         private bool ValidateBindings()
@@ -770,6 +937,11 @@ namespace Hatago.IkebanaUdonSnip
 
         private void RestoreUncutVisualState()
         {
+            if (_isCutJobRunning)
+            {
+                ResetCutJobState();
+            }
+
             CaptureInitialTransformState(false);
             RestoreTrackedTransform(
                 sourceMeshFilter != null ? sourceMeshFilter.transform : null,
@@ -929,6 +1101,34 @@ namespace Hatago.IkebanaUdonSnip
                 _triNegPolyUv = new Vector2[6];
                 _triNegPolyD = new float[6];
                 _triCutPoints = new Vector3[3];
+            }
+        }
+
+        private void EnsureCutWorkBuffers(bool collectCapSegments)
+        {
+            if (_cutJobPosVertices == null || _cutJobPosVertices.Length != maxGeneratedVerticesPerSide)
+            {
+                _cutJobPosVertices = new Vector3[maxGeneratedVerticesPerSide];
+                _cutJobPosNormals = new Vector3[maxGeneratedVerticesPerSide];
+                _cutJobPosUv = new Vector2[maxGeneratedVerticesPerSide];
+                _cutJobNegVertices = new Vector3[maxGeneratedVerticesPerSide];
+                _cutJobNegNormals = new Vector3[maxGeneratedVerticesPerSide];
+                _cutJobNegUv = new Vector2[maxGeneratedVerticesPerSide];
+            }
+
+            if (_cutJobPosIndices == null || _cutJobPosIndices.Length != maxGeneratedIndicesPerSide)
+            {
+                _cutJobPosIndices = new int[maxGeneratedIndicesPerSide];
+                _cutJobNegIndices = new int[maxGeneratedIndicesPerSide];
+            }
+
+            if (collectCapSegments)
+            {
+                if (_cutJobCapSegmentStart == null || _cutJobCapSegmentStart.Length != maxCutIntersections)
+                {
+                    _cutJobCapSegmentStart = new Vector3[maxCutIntersections];
+                    _cutJobCapSegmentEnd = new Vector3[maxCutIntersections];
+                }
             }
         }
 
@@ -1098,6 +1298,7 @@ namespace Hatago.IkebanaUdonSnip
             float d1,
             float d2,
             Vector3 referenceNormal,
+            bool collectCapSegments,
             Vector3[] posVertices,
             Vector3[] posNormals,
             Vector2[] posUv,
@@ -1136,6 +1337,11 @@ namespace Hatago.IkebanaUdonSnip
             EmitClippedPolygon(
                 _triNegPolyV, _triNegPolyN, _triNegPolyUv, negCount, referenceNormal,
                 negVertices, negNormals, negUv, negIndices, ref negVertexCount, ref negIndexCount);
+
+            if (!collectCapSegments || capSegmentStart == null || capSegmentEnd == null)
+            {
+                return;
+            }
 
             AddTriangleCutSegment(
                 v0, v1, v2,
@@ -2460,7 +2666,8 @@ namespace Hatago.IkebanaUdonSnip
                 _isSyncChunkSending = false;
                 _syncChunkRetryCount = 0;
             }
-            bool requiresFullReplay = _appliedSyncOpCount > opCount || _syncLastOpType == 2 || _syncLastOpType == 3;
+            bool sameCountCutRevision = _syncLastOpType == 1 && _syncRevision > _appliedSyncRevision && opCount == _appliedSyncOpCount;
+            bool requiresFullReplay = _appliedSyncOpCount > opCount || _syncLastOpType == 2 || _syncLastOpType == 3 || sameCountCutRevision;
             if (requiresFullReplay)
             {
                 RestoreUncutVisualState();
@@ -2603,11 +2810,27 @@ namespace Hatago.IkebanaUdonSnip
             _syncLastOpType = 1;
             _syncLastOpSlot = slotId;
 
-            AppendAndTrimSyncOperation(slotId, nextStage, planePointLocal, planeNormalLocal);
+            bool replacedOldestOperation = AppendAndTrimSyncOperation(slotId, nextStage, planePointLocal, planeNormalLocal);
             int opCount = ClampLocalOpCount();
             _syncPublishTargetOpCount = opCount;
             _syncCutStage = nextStage;
             _appliedSyncOpCount = opCount;
+
+            // 履歴上限到達時はopCountが同じまま中身だけ更新されるため、1回は必ず再送する。
+            if (replacedOldestOperation && _syncOpCount >= _syncPublishTargetOpCount)
+            {
+                Log("Sync op buffer was shifted at max capacity. Forcing full snapshot serialization.");
+                int publishSlotCount = Mathf.Clamp(_syncSlotCount, 1, MaxSyncSlots);
+                int publishSlotId = GetConfiguredSlotId(publishSlotCount);
+                ApplyPublishedStageState(publishSlotCount, opCount, publishSlotId);
+                _syncRevision = _syncRevision + 1;
+                _appliedSyncRevision = _syncRevision;
+                _isSyncChunkSending = false;
+                _syncChunkRetryCount = 0;
+                RequestSerialization();
+                return;
+            }
+
             BeginChunkSerialization();
         }
 
@@ -2690,13 +2913,15 @@ namespace Hatago.IkebanaUdonSnip
             RequestSerialization();
         }
 
-        private void AppendAndTrimSyncOperation(int slotId, int stage, Vector3 planePointLocal, Vector3 planeNormalLocal)
+        private bool AppendAndTrimSyncOperation(int slotId, int stage, Vector3 planePointLocal, Vector3 planeNormalLocal)
         {
             int opCount = ClampLocalOpCount();
+            bool replacedOldestOperation = false;
             if (opCount >= MaxSyncOps)
             {
                 ShiftSyncOperationsLeft(opCount - MaxSyncOps + 1);
                 opCount = ClampLocalOpCount();
+                replacedOldestOperation = true;
             }
 
             int writeIndex = opCount;
@@ -2717,6 +2942,8 @@ namespace Hatago.IkebanaUdonSnip
             {
                 _syncOpCount = _syncLocalOpCount;
             }
+
+            return replacedOldestOperation;
         }
 
         private void ShiftSyncOperationsLeft(int removeCount)
