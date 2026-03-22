@@ -213,6 +213,15 @@ namespace Hatago.IkebanaUdonSnip.Editor
             relay.minInvokeIntervalSeconds = 0.15f;
             relay.enableDebugLog = false;
 
+            AudioSource cutAudioSource = scissorObject.GetComponent<AudioSource>();
+            if (cutAudioSource == null)
+            {
+                cutAudioSource = Undo.AddComponent<AudioSource>(scissorObject);
+            }
+            cutAudioSource.playOnAwake = false;
+            cutAudioSource.spatialBlend = 0f;
+            contactPicker.cutAudioSource = cutAudioSource;
+
             EditorUtility.SetDirty(cutter);
             EditorUtility.SetDirty(contactPicker);
             EditorUtility.SetDirty(relay);

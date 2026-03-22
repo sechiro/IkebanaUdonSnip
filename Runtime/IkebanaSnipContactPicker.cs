@@ -16,6 +16,8 @@ namespace Hatago.IkebanaUdonSnip
         public IkebanaUdonSnip[] registeredRootCutters;
         public int registeredRootCutterCount;
         public bool restrictToRootCutterBranch = true;
+        public AudioSource cutAudioSource;
+        public AudioClip cutAudioClip;
         public bool enableDebugLog;
 
         private IkebanaUdonSnip[] _trackedCutters;
@@ -183,6 +185,10 @@ namespace Hatago.IkebanaUdonSnip
             {
                 int beforeCutVersion = target.GetCutVersion();
                 target.CutNow();
+                if (cutAudioSource != null && cutAudioClip != null)
+                {
+                    cutAudioSource.PlayOneShot(cutAudioClip);
+                }
                 _nextCutAllowedTime = Time.time + minCutIntervalSeconds;
                 if (target.GetCutVersion() > beforeCutVersion)
                 {
