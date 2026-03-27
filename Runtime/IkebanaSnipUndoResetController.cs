@@ -21,6 +21,8 @@ namespace Hatago.IkebanaUdonSnip
         public float resetOffsetXMeters = -0.3f;
         public float resetOffsetYMeters = 0.5f;
         public bool hideUndoButtonAfterUndo = true;
+        public GameObject scissorResetButtonObject;
+        public float scissorResetOffsetYMeters = 0.5f;
         public bool enableDebugLog;
 
         private const float HoldSeconds = 1f;
@@ -28,11 +30,16 @@ namespace Hatago.IkebanaUdonSnip
         private Vector3 _resetReferenceInitialPosition;
         private Quaternion _resetReferenceInitialRotation;
         private Vector3 _resetReferenceInitialLocalScale;
+        private bool _scissorInitialCaptured;
+        private Vector3 _scissorInitialPosition;
+        private Quaternion _scissorInitialRotation;
 
         public void Start()
         {
             CaptureResetReferenceState();
             PlaceResetButton();
+            CaptureScissorInitialState();
+            PlaceScissorResetButton();
             ApplyHoldSeconds();
 
             if (undoButtonObject != null)
@@ -234,10 +241,94 @@ namespace Hatago.IkebanaUdonSnip
             resetButtonObject.transform.rotation = Quaternion.identity;
         }
 
+        public void ExecuteScissorReset()
+        {
+            TryRespawnScissorWithManualSync();
+        }
+
+        private void CaptureScissorInitialState()
+        {
+            if (_scissorInitialCaptured || scissorTransform == null)
+            {
+                return;
+            }
+
+            _scissorInitialPosition = scissorTransform.position;
+            _scissorInitialRotation = scissorTransform.rotation;
+            _scissorInitialCaptured = true;
+        }
+
+        private void PlaceScissorResetButton()
+        {
+            CaptureScissorInitialState();
+            if (scissorResetButtonObject == null || !_scissorInitialCaptured)
+            {
+                return;
+            }
+
+            scissorResetButtonObject.transform.position = _scissorInitialPosition + Vector3.up * scissorResetOffsetYMeters;
+            scissorResetButtonObject.transform.rotation = Quaternion.identity;
+        }
+
+        private void TryRespawnScissorWithManualSync()
+        {
+            if (scissorTransform == null)
+            {
+                return;
+            }
+
+            Transform current = scissorTransform;
+            int depth = 0;
+            while (current != null && depth < 16)
+            {
+                UdonBehaviour syncBehaviour = current.GetComponent<UdonBehaviour>();
+                if (syncBehaviour != null)
+                {
+                    VRCPlayerApi localPlayer = Networking.LocalPlayer;
+                    if (!Utilities.IsValid(localPlayer))
+                    {
+                        return;
+                    }
+
+                    GameObject host = syncBehaviour.gameObject;
+                    if (!Networking.IsOwner(host))
+                    {
+                        Networking.SetOwner(localPlayer, host);
+                        if (!Networking.IsOwner(host))
+                        {
+                            if (enableDebugLog)
+                            {
+                                Debug.Log("[IkebanaSnipUndoResetController] Could not acquire owner for scissor reset.", this);
+                            }
+
+                            current = current.parent;
+                            depth++;
+                            continue;
+                        }
+                    }
+
+                    syncBehaviour.SendCustomEvent("Respawn");
+                    return;
+                }
+
+                current = current.parent;
+                depth++;
+            }
+
+            if (!_scissorInitialCaptured)
+            {
+                return;
+            }
+
+            scissorTransform.position = _scissorInitialPosition;
+            scissorTransform.rotation = _scissorInitialRotation;
+        }
+
         private void ApplyHoldSeconds()
         {
             ApplyHoldSecondsToButton(undoButtonObject);
             ApplyHoldSecondsToButton(resetButtonObject);
+            ApplyHoldSecondsToButton(scissorResetButtonObject);
         }
 
         private void ApplyHoldSecondsToButton(GameObject buttonObject)

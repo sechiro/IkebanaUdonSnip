@@ -187,7 +187,7 @@ namespace Hatago.IkebanaUdonSnip
                 target.CutNow();
                 if (cutAudioSource != null && cutAudioClip != null)
                 {
-                    cutAudioSource.PlayOneShot(cutAudioClip);
+                    SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.All, nameof(PlayCutSoundGlobal));
                 }
                 _nextCutAllowedTime = Time.time + minCutIntervalSeconds;
                 if (target.GetCutVersion() > beforeCutVersion)
@@ -201,6 +201,14 @@ namespace Hatago.IkebanaUdonSnip
                     _pendingCutCheckFrames = 0;
                     SendCustomEventDelayedFrames(nameof(CheckPendingCutCompletion), 1);
                 }
+            }
+        }
+
+        public void PlayCutSoundGlobal()
+        {
+            if (cutAudioSource != null && cutAudioClip != null)
+            {
+                cutAudioSource.PlayOneShot(cutAudioClip);
             }
         }
 

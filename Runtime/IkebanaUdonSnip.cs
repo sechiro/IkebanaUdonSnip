@@ -41,7 +41,7 @@ namespace Hatago.IkebanaUdonSnip
         public bool disableSourceAfterCut = true;
         public bool updateOutputColliders = true;
         public bool updateSourceColliderWhenNotDisabling = true;
-        public bool allowMultipleCuts = false;
+
         public bool generateCutCaps = false;
         public bool separatePiecesAfterCut = true;
         public float separationDistanceMeters = 0.01f;
@@ -120,6 +120,7 @@ namespace Hatago.IkebanaUdonSnip
         private int _appliedSyncRevision = -1;
         private int _appliedSyncOpCount;
         private bool _isApplyingSyncedCut;
+        private bool _pendingSyncProcess;
         private int[] _stageScratch = new int[MaxSyncSlots];
         private int _syncLocalOpCount;
         private int _syncPublishTargetOpCount;
@@ -235,6 +236,12 @@ namespace Hatago.IkebanaUdonSnip
         {
             if (!enableGlobalSync || !applySyncedCutOnDeserialize)
             {
+                return;
+            }
+
+            if (_isCutJobRunning)
+            {
+                _pendingSyncProcess = true;
                 return;
             }
 
@@ -370,7 +377,6 @@ namespace Hatago.IkebanaUdonSnip
 
                 _isApplyingSyncedCut = true;
                 CutAtLocalPlane(localPoint, localNormal);
-                _isApplyingSyncedCut = false;
             }
 
             ApplyPublishedStageState(slotCount, opCount, slotId);
@@ -462,7 +468,7 @@ namespace Hatago.IkebanaUdonSnip
                 return;
             }
 
-            if (_hasCut && !allowMultipleCuts)
+            if (_hasCut)
             {
                 return;
             }
@@ -528,9 +534,9 @@ namespace Hatago.IkebanaUdonSnip
                 return;
             }
 
-            if (_hasCut && !allowMultipleCuts)
+            if (_hasCut)
             {
-                Log("Cut suppressed because allowMultipleCuts is false.");
+                Log("Cut suppressed because this cutter has already been cut.");
                 return;
             }
 
@@ -560,7 +566,7 @@ namespace Hatago.IkebanaUdonSnip
                 return;
             }
 
-            bool useBatchedCut = spreadCutOverMultipleFrames && !_isApplyingSyncedCut;
+            bool useBatchedCut = spreadCutOverMultipleFrames;
             if (!useBatchedCut)
             {
                 ProcessCutTrianglesBatch(_cutJobTriangleCount);
@@ -838,6 +844,7 @@ namespace Hatago.IkebanaUdonSnip
         private void ResetCutJobState()
         {
             _isCutJobRunning = false;
+            _isApplyingSyncedCut = false;
             _cutJobSourceMesh = null;
             _cutJobSourceVertices = null;
             _cutJobSourceTriangles = null;
@@ -853,6 +860,12 @@ namespace Hatago.IkebanaUdonSnip
             _cutJobNegVertexCount = 0;
             _cutJobNegIndexCount = 0;
             _cutJobCapSegmentCount = 0;
+
+            if (_pendingSyncProcess)
+            {
+                _pendingSyncProcess = false;
+                ApplySyncedCutFromState();
+            }
         }
 
         private bool ValidateBindings()
@@ -2704,7 +2717,7 @@ namespace Hatago.IkebanaUdonSnip
 
         private void ApplyLegacySyncedCutIfNeeded()
         {
-            if (_hasCut && !allowMultipleCuts)
+            if (_hasCut)
             {
                 return;
             }
@@ -2726,7 +2739,6 @@ namespace Hatago.IkebanaUdonSnip
 
             _isApplyingSyncedCut = true;
             CutAtLocalPlane(localPoint, localNormal);
-            _isApplyingSyncedCut = false;
         }
 
         private void ApplySyncedOperationAtIndex(int opIndex, int slotCount)
@@ -2749,7 +2761,7 @@ namespace Hatago.IkebanaUdonSnip
                 return;
             }
 
-            if (_hasCut && !allowMultipleCuts)
+            if (_hasCut)
             {
                 return;
             }
@@ -2770,7 +2782,6 @@ namespace Hatago.IkebanaUdonSnip
 
             _isApplyingSyncedCut = true;
             CutAtLocalPlane(localPoint, localNormal);
-            _isApplyingSyncedCut = false;
         }
 
         private void TrySyncCutState(Vector3 planePointLocal, Vector3 planeNormalLocal)

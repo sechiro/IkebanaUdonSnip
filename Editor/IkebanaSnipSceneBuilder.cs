@@ -191,7 +191,7 @@ namespace Hatago.IkebanaUdonSnip.Editor
             {
                 relay = UdonSharpUndo.AddComponent<IkebanaSnipEventRelay>(scissorObject);
             }
-            IkebanaSnipUndoResetController sharedUndoController = GetOrCreateSharedUndoController(scissorObject, contactPicker);
+            IkebanaSnipUndoResetController sharedUndoController = GetOrCreateSharedUndoController(scissorObject, contactPicker, root.transform);
             IkebanaSnipUndoResetController setupResetController = CreateSetupResetController(
                 root.transform,
                 scissorObject,
@@ -287,7 +287,7 @@ namespace Hatago.IkebanaUdonSnip.Editor
             cutter.negativeOutputMeshCollider = negative.GetComponent<MeshCollider>();
             cutter.cutPlaneTransform = cutPlaneTransform;
             cutter.useCutPlaneUpAxis = false;
-            cutter.allowMultipleCuts = true;
+
             cutter.enableCutOnTriggerEnter = false;
             cutter.requiredCutterTriggerName = "CutTrigger";
             cutter.generateCutCaps = false;
@@ -641,7 +641,8 @@ namespace Hatago.IkebanaUdonSnip.Editor
 
         private static IkebanaSnipUndoResetController GetOrCreateSharedUndoController(
             GameObject scissorObject,
-            IkebanaSnipContactPicker contactPicker)
+            IkebanaSnipContactPicker contactPicker,
+            Transform staticParent)
         {
             if (scissorObject == null)
             {
@@ -716,7 +717,46 @@ namespace Hatago.IkebanaUdonSnip.Editor
 
             SetInteractionConfig(undoHold, undoHoldUdon, "Undo", 0.1f);
 
+            Transform scissorResetParent = staticParent != null ? staticParent : controlsRoot.transform;
+            GameObject scissorResetButton = controller.scissorResetButtonObject;
+            if (scissorResetButton == null)
+            {
+                scissorResetButton = FindChildObject(scissorResetParent, "ScissorResetButtonCube");
+                if (scissorResetButton == null)
+                {
+                    scissorResetButton = CreateControlButtonCube(scissorResetParent, "ScissorResetButtonCube", new Vector3(-0.2f, 0.2f, 0f));
+                }
+            }
+            GameObject scissorResetProgress = FindChildObject(scissorResetParent, "ScissorResetButtonProgressCircle");
+            if (scissorResetProgress == null)
+            {
+                scissorResetProgress = CreateControlProgressCircle(scissorResetParent, "ScissorResetButtonProgressCircle");
+            }
+            EnsureControlLabelExists(scissorResetButton.transform, "ScissorResetButtonLabel", "Sc.Reset");
+            IkebanaSnipHoldUseButton scissorResetHold = scissorResetButton.GetComponent<IkebanaSnipHoldUseButton>();
+            if (scissorResetHold == null)
+            {
+                scissorResetHold = UdonSharpUndo.AddComponent<IkebanaSnipHoldUseButton>(scissorResetButton);
+            }
+            UdonBehaviour scissorResetHoldUdon = UdonSharpEditorUtility.GetBackingUdonBehaviour(scissorResetHold);
+
+            controller.scissorResetButtonObject = scissorResetButton;
+            controller.scissorResetOffsetYMeters = 0.5f;
+
+            scissorResetHold.targetBehaviour = controllerUdon;
+            scissorResetHold.holdCompleteEventName = "ExecuteScissorReset";
+            scissorResetHold.requiredHoldSeconds = 1f;
+            scissorResetHold.deactivateAfterInvoke = false;
+            scissorResetHold.progressVisual = scissorResetProgress != null ? scissorResetProgress.transform : null;
+            scissorResetHold.progressOffsetMeters = 0.05f;
+            scissorResetHold.progressRadiusMeters = 0.03f;
+            scissorResetHold.progressThicknessMeters = 0.002f;
+            scissorResetHold.enableDebugLog = false;
+
+            SetInteractionConfig(scissorResetHold, scissorResetHoldUdon, "Sc.Reset", 0.1f);
+
             EditorUtility.SetDirty(undoHold);
+            EditorUtility.SetDirty(scissorResetHold);
             EditorUtility.SetDirty(controller);
             return controller;
         }
